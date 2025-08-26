@@ -585,7 +585,15 @@ class LoadImagesAndLabels(Dataset):
                         # f += [p.parent / x.lstrip(os.sep) for x in t]  # to global path (pathlib)
                 else:
                     raise FileNotFoundError(f"{prefix}{p} does not exist")
-            self.im_files = sorted(x.replace("/", os.sep) for x in f if x.split(".")[-1].lower() in IMG_FORMATS)
+            # Separate and pair RGB + IR images
+            self.rgb_files = sorted([x for x in f if f"{os.sep}rgb{os.sep}" in x and x.split(".")[-1].lower() in IMG_FORMATS])
+            self.ir_files = [x.replace(f"{os.sep}rgb{os.sep}", f"{os.sep}ir{os.sep}") for x in self.rgb_files]  # assumes 1:1 filename match
+
+            # Validation
+            assert all(os.path.exists(ir) for ir in self.ir_files), "Some IR images are missing for the RGB–IR pairs."
+
+            self.im_files = self.rgb_files  # For label handling downstream
+
             # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
             assert self.im_files, f"{prefix}No images found"
         except Exception as e:
@@ -770,35 +778,37 @@ class LoadImagesAndLabels(Dataset):
     #     return self
 
     def __getitem__(self, index):
-        """Fetches the dataset item at the given index, considering linear, shuffled, or weighted sampling."""
-        index = self.indices[index]  # linear, shuffled, or image_weights
+        index = self.indices[index]
 
         hyp = self.hyp
         if mosaic := self.mosaic and random.random() < hyp["mosaic"]:
-            # Load mosaic
-            img, labels = self.load_mosaic(index)
+            # You will need to update `load_mosaic()` to support both RGB and IR
+            img_rgb, labels = self.load_mosaic(index, modality='rgb')
+            img_ir, _ = self.load_mosaic(index, modality='ir')
             shapes = None
 
-            # MixUp augmentation
             if random.random() < hyp["mixup"]:
-                img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
+                img_rgb, labels = mixup(img_rgb, labels, *self.load_mosaic(random.choice(self.indices), modality='rgb'))
+                img_ir, _ = mixup(img_ir, labels, *self.load_mosaic(random.choice(self.indices), modality='ir'))
 
         else:
-            # Load image
-            img, (h0, w0), (h, w) = self.load_image(index)
+            # Load RGB and IR images
+            img_rgb, (h0, w0), (h, w) = self.load_image(index)
+            img_ir, _, _ = self.load_image(index)
 
-            # Letterbox
-            shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
-            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
-            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+            shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size
+            img_rgb, ratio, pad = letterbox(img_rgb, shape, auto=False, scaleup=self.augment)
+            img_ir, _, _ = letterbox(img_ir, shape, auto=False, scaleup=self.augment)  # Apply same resizing
+
+            shapes = (h0, w0), ((h / h0, w / w0), pad)
 
             labels = self.labels[index].copy()
-            if labels.size:  # normalized xywh to pixel xyxy format
+            if labels.size:
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
             if self.augment:
-                img, labels = random_perspective(
-                    img,
+                img_rgb, labels = random_perspective(
+                    img_rgb,
                     labels,
                     degrees=hyp["degrees"],
                     translate=hyp["translate"],
@@ -807,68 +817,139 @@ class LoadImagesAndLabels(Dataset):
                     perspective=hyp["perspective"],
                 )
 
-        nl = len(labels)  # number of labels
+                img_ir, _ = random_perspective(
+                    img_ir,
+                    labels.copy(),  # Don't alter labels again
+                    degrees=hyp["degrees"],
+                    translate=hyp["translate"],
+                    scale=hyp["scale"],
+                    shear=hyp["shear"],
+                    perspective=hyp["perspective"],
+                )
+
+        nl = len(labels)
         if nl:
-            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
+            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img_rgb.shape[1], h=img_rgb.shape[0], clip=True, eps=1e-3)
 
         if self.augment:
-            # Albumentations
-            img, labels = self.albumentations(img, labels)
-            nl = len(labels)  # update after albumentations
+            img_rgb, labels = self.albumentations(img_rgb, labels)
+            img_ir, _ = self.albumentations(img_ir, labels.copy())
 
-            # HSV color-space
-            augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
+            nl = len(labels)
 
-            # Flip up-down
+            augment_hsv(img_rgb, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
+            # Optional: apply HSV to IR too (if 3-channel), or skip
+
             if random.random() < hyp["flipud"]:
-                img = np.flipud(img)
+                img_rgb = np.flipud(img_rgb)
+                img_ir = np.flipud(img_ir)
                 if nl:
                     labels[:, 2] = 1 - labels[:, 2]
 
-            # Flip left-right
             if random.random() < hyp["fliplr"]:
-                img = np.fliplr(img)
+                img_rgb = np.fliplr(img_rgb)
+                img_ir = np.fliplr(img_ir)
                 if nl:
                     labels[:, 1] = 1 - labels[:, 1]
-
-            # Cutouts
-            # labels = cutout(img, labels, p=0.5)
-            # nl = len(labels)  # update after cutout
 
         labels_out = torch.zeros((nl, 6))
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
 
-        # Convert
-        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-        img = np.ascontiguousarray(img)
+        # Convert RGB and IR to tensor
+        # img_rgb = img_rgb.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        
+        # Swap RGB only, keep IR last
+        # rgb = img[..., :3][..., ::-1]  # BGR → RGB
+        # ir  = img[..., 3:]
+        # img = np.concatenate((rgb, ir), axis=-1)  # HWC
+        # img = img.transpose((2, 0, 1))  # CHW
+        rgb = img_rgb[..., :3][..., ::-1]  # BGR → RGB
+        ir = img_rgb[..., 3:]
+        img_rgb = np.concatenate((rgb, ir), axis=-1)
+        img_rgb = img_rgb.transpose((2, 0, 1))  # HWC to CHW, BGR to RGB
 
-        return torch.from_numpy(img), labels_out, self.im_files[index], shapes
+        
 
-    def load_image(self, i):
+        
+        # img_ir = img_ir.transpose((2, 0, 1))[::-1]
+
+
+
+        img_rgb = np.ascontiguousarray(img_rgb)
+        # img_ir = np.ascontiguousarray(img_ir)
+
+        return (
+            torch.from_numpy(img_rgb),
+            # torch.from_numpy(img_ir),
+            labels_out,
+            self.im_files[index],
+            shapes,
+        )
+
+
+
+    def load_image(self, i, modality=None):
         """
-        Loads an image by index, returning the image, its original dimensions, and resized dimensions.
+        Loads an RGB and IR image pair by index, returning a fused image, or only RGB or IR, and dimensions.
 
-        Returns (im, original hw, resized hw)
+        Args:
+            i: index
+            modality: 'rgb', 'ir', or None (fused)
+        Returns:
+            (image, original_hw, resized_hw)
         """
-        im, f, fn = (
+        im, f_rgb, f_ir, fn = (
             self.ims[i],
-            self.im_files[i],
+            self.rgb_files[i],
+            self.ir_files[i],
             self.npy_files[i],
         )
-        if im is None:  # not cached in RAM
-            if fn.exists():  # load npy
+
+        if im is None:
+            if fn.exists():
                 im = np.load(fn)
-            else:  # read image
-                im = cv2.imread(f)  # BGR
-                assert im is not None, f"Image Not Found {f}"
-            h0, w0 = im.shape[:2]  # orig hw
-            r = self.img_size / max(h0, w0)  # ratio
-            if r != 1:  # if sizes are not equal
+            else:
+                # Load RGB (BGR) and IR
+                rgb = cv2.imread(f_rgb)  # BGR
+                ir = cv2.imread(f_ir, cv2.IMREAD_GRAYSCALE)  # Single channel
+
+                assert rgb is not None and ir is not None, f"Image Not Found: {f_rgb} or {f_ir}"
+
+                # Resize both images to the same shape
+                h0, w0 = rgb.shape[:2]  # original hw
+                r = self.img_size / max(h0, w0)  # resize ratio
+
                 interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
-                im = cv2.resize(im, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
-            return im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
-        return self.ims[i], self.im_hw0[i], self.im_hw[i]  # im, hw_original, hw_resized
+                rgb = cv2.resize(rgb, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
+                ir = cv2.resize(ir, (rgb.shape[1], rgb.shape[0]), interpolation=interp)
+
+                # Stack IR as 4th channel
+                ir_exp = np.expand_dims(ir, axis=-1)  # HWC → HWC1
+                im_fused = np.concatenate((rgb, ir_exp), axis=-1)  # HWC3 + HWC1 → HWC4
+
+                # Save to cache if needed
+                im = im_fused
+
+            # If modality is requested, return only that channel
+            if modality == 'rgb':
+                return rgb, (h0, w0), rgb.shape[:2]
+            elif modality == 'ir':
+                return ir_exp, (h0, w0), ir_exp.shape[:2]
+            else:
+                return im, (h0, w0), im.shape[:2]
+
+        # If already cached in RAM
+        h0, w0 = self.im_hw0[i] if hasattr(self, 'im_hw0') and self.im_hw0[i] is not None else (im.shape[0], im.shape[1])
+        if modality == 'rgb':
+            rgb = im[..., :3]
+            return rgb, (h0, w0), rgb.shape[:2]
+        elif modality == 'ir':
+            ir = im[..., 3:]
+            return ir, (h0, w0), ir.shape[:2]
+        else:
+            return im, (h0, w0), im.shape[:2]
+
 
     def cache_images_to_disk(self, i):
         """Saves an image to disk as an *.npy file for quicker loading, identified by index `i`."""
@@ -876,49 +957,61 @@ class LoadImagesAndLabels(Dataset):
         if not f.exists():
             np.save(f.as_posix(), cv2.imread(self.im_files[i]))
 
-    def load_mosaic(self, index):
-        """Loads a 4-image mosaic for YOLOv5, combining 1 selected and 3 random images, with labels and segments."""
+    def load_mosaic(self, index, modality=None):
+        """
+        Loads a 4-image mosaic for YOLOv5, combining RGB and IR images with fusion,
+        1 selected and 3 random images, with labels and segments.
+        """
         labels4, segments4 = [], []
         s = self.img_size
-        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y
-        indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
+        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center
+        indices = [index] + random.choices(self.indices, k=3)
         random.shuffle(indices)
-        for i, index in enumerate(indices):
-            # Load image
-            img, _, (h, w) = self.load_image(index)
 
-            # place img in img4
-            if i == 0:  # top left
-                img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
-                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
-                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
-            elif i == 1:  # top right
+        for i, index in enumerate(indices):
+            # Load image based on modality
+            if modality == 'rgb' or modality == 'ir':
+                img, _, (h, w) = self.load_image(index, modality=modality)
+            else:
+                # Default: fusion (original behavior)
+                rgb, _, (h, w) = self.load_image(index, modality="rgb")
+                ir, _, _ = self.load_image(index, modality="ir")
+                if ir.shape[:2] != rgb.shape[:2]:
+                    ir = cv2.resize(ir, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
+                if len(ir.shape) == 2:
+                    ir = ir[:, :, None]
+                img = np.concatenate([rgb, ir], axis=2)
+
+            if i == 0:
+                img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)
+                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
+            elif i == 1:
                 x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
                 x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
-            elif i == 2:  # bottom left
+            elif i == 2:
                 x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
                 x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
-            elif i == 3:  # bottom right
+            elif i == 3:
                 x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
                 x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
 
-            img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
+            img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]
             padw = x1a - x1b
             padh = y1a - y1b
 
             # Labels
             labels, segments = self.labels[index].copy(), self.segments[index].copy()
             if labels.size:
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)
                 segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
             labels4.append(labels)
             segments4.extend(segments)
 
-        # Concat/clip labels
+        # Concatenate and clip
         labels4 = np.concatenate(labels4, 0)
         for x in (labels4[:, 1:], *segments4):
-            np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
-        # img4, labels4 = replicate(img4, labels4)  # replicate
+            np.clip(x, 0, 2 * s, out=x)
 
         # Augment
         img4, labels4, segments4 = copy_paste(img4, labels4, segments4, p=self.hyp["copy_paste"])
@@ -932,9 +1025,10 @@ class LoadImagesAndLabels(Dataset):
             shear=self.hyp["shear"],
             perspective=self.hyp["perspective"],
             border=self.mosaic_border,
-        )  # border to remove
+        )
 
         return img4, labels4
+
 
     def load_mosaic9(self, index):
         """Loads 1 image + 8 random images into a 9-image mosaic for augmented YOLOv5 training, returning labels and

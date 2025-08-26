@@ -129,3 +129,25 @@ def attempt_load(weights, device=None, inplace=True, fuse=True):
     model.stride = model[torch.argmax(torch.tensor([m.stride.max() for m in model])).int()].stride  # max stride
     assert all(model[0].nc == m.nc for m in model), f"Models have different class counts: {[m.nc for m in model]}"
     return model
+
+from models.common import Conv, C3, SPPF
+from models.fusion import MAFModule
+
+class DualBackbone(nn.Module):
+    def __init__(self, channels=[3, 32, 64, 128, 256]):
+        super().__init__()
+        self.rgb_conv1 = Conv(channels[0], channels[1], 3, 1)
+        self.ir_conv1 = Conv(channels[0], channels[1], 3, 1)
+
+        self.rgb_conv2 = Conv(channels[1], channels[2], 3, 2)
+        self.ir_conv2 = Conv(channels[1], channels[2], 3, 2)
+
+        self.fusion = MAFModule(channels[2])
+        self.conv_out = C3(channels[2]*2, channels[3], n=3)
+
+    def forward(self, x_rgb, x_ir):
+        rgb = self.rgb_conv2(self.rgb_conv1(x_rgb))
+        ir = self.ir_conv2(self.ir_conv1(x_ir))
+        fused = self.fusion(rgb, ir)
+        out = self.conv_out(fused)
+        return out

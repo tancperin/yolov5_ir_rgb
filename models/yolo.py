@@ -396,6 +396,19 @@ def parse_model(d, ch):
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
         m = eval(m) if isinstance(m, str) else m  # eval strings
+        if m.__name__ == "DualBackbone":
+            # You may want to customize args or infer input/output channels if needed
+            c2 = 256  # or whatever your fusion backbone outputs
+            m_ = m(*args)
+            t = str(m)[8:-2]
+            np = sum(x.numel() for x in m_.parameters())
+            m_.i, m_.f, m_.type, m_.np = i, f, t, np
+            LOGGER.info(f"{i:>3}{str(f):>18}{n:>3}{np:10.0f}  {t:<40}{str(args):<30}")
+            save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
+            layers.append(m_)
+            ch.append(c2)
+            continue  # skip the rest of this loop
+
         for j, a in enumerate(args):
             with contextlib.suppress(NameError):
                 args[j] = eval(a) if isinstance(a, str) else a  # eval strings
@@ -454,6 +467,8 @@ def parse_model(d, ch):
         LOGGER.info(f"{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}")  # print
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
+        if i == 0 and isinstance(args[0], int) and args[0] == 3:
+            args[0] = 4  # set input channels to 4 (RGB + IR)
         if i == 0:
             ch = []
         ch.append(c2)
